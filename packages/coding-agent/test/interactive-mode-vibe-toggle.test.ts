@@ -1,3 +1,4 @@
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
 /**
  * Contracts: /vibe mode toggle on InteractiveMode.
  *
@@ -16,7 +17,7 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
-import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -653,6 +654,7 @@ describe("InteractiveMode vibe mode toggle", () => {
 
 	it("passes the session's active model into vibe rehydration on resume", async () => {
 		await mode.init({ suppressWelcomeIntro: true });
+		session.setThinkingLevel(Effort.High);
 		await mode.handleVibeModeCommand();
 		await session.sessionManager.ensureOnDisk();
 		const sessionFile = session.sessionFile;
@@ -671,9 +673,9 @@ describe("InteractiveMode vibe mode toggle", () => {
 		expect(await session.switchSession(sessionFile)).toBe(true);
 
 		// Rehydration must resolve workers against the reopened session's active
-		// model (so the `good`/pi/task worker tracks it), not the settings default.
+		// model (so the `good`/pi/task worker tracks it), including its selected effort, not the settings default.
 		expect(rehydrateCalled).toBe(true);
-		expect(activeModelDuringRehydrate).toBe(`${expectedModel.provider}/${expectedModel.id}`);
+		expect(activeModelDuringRehydrate).toBe(`${expectedModel.provider}/${expectedModel.id}:high`);
 	});
 
 	it("suspends the old scope without tombstones when switching to another vibe parent", async () => {
@@ -734,10 +736,12 @@ describe("InteractiveMode vibe mode toggle", () => {
 		await session.sessionManager.ensureOnDisk();
 		const sessionFile = session.sessionFile;
 		if (!sessionFile) throw new Error("Expected persisted session file");
+		const entryId = session.sessionManager.appendMessage({ role: "user", content: "seed", timestamp: Date.now() });
 
 		await expect(session.newSession()).rejects.toThrow("Exit vibe mode first");
 		await expect(session.newSession({ drop: true })).rejects.toThrow("Exit vibe mode first");
 		await expect(session.fork()).rejects.toThrow("Exit vibe mode first");
+		await expect(session.fork(entryId)).rejects.toThrow("Exit vibe mode first");
 		await expect(session.moveSession(path.join(tempDir.path(), "other-project"))).rejects.toThrow(
 			"Exit vibe mode first",
 		);
@@ -755,7 +759,7 @@ describe("InteractiveMode vibe mode toggle", () => {
 		const warning = vi.spyOn(mode, "showWarning");
 
 		await expect(mode.handleClearCommand()).resolves.toBeUndefined();
-		await expect(mode.handleDropCommand()).resolves.toBeUndefined();
+		await expect(mode.handleDeleteCommand()).resolves.toBeUndefined();
 		await expect(mode.handleForkCommand()).resolves.toBeUndefined();
 		await expect(mode.handleMoveCommand(path.join(tempDir.path(), "other-project"))).resolves.toBeUndefined();
 

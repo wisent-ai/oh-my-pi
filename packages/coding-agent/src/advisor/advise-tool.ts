@@ -1,4 +1,6 @@
 import { type } from "@oh-my-pi/omptype";
+import { type AdvisorSeverity, type AdvisorNote } from "@oh-my-pi/pi-tui/chat/messages";
+export { type AdvisorSeverity, type AdvisorNote, type AdvisorMessageDetails } from "@oh-my-pi/pi-tui/chat/messages";
 import type {
 	AgentIdentity,
 	AgentTelemetryConfig,
@@ -20,26 +22,11 @@ const adviseSchema = type({
 
 export type AdviseParams = typeof adviseSchema.infer;
 
-export type AdvisorSeverity = "nit" | "concern" | "blocker";
-
 export interface AdviseDetails {
 	note: string;
 	severity?: AdvisorSeverity;
 	/** Which configured advisor produced this note (omitted for the default advisor). */
 	advisor?: string;
-}
-
-/** One queued advice note. */
-export interface AdvisorNote {
-	note: string;
-	severity?: AdvisorSeverity;
-	/** Which configured advisor produced this note (omitted for the default advisor). */
-	advisor?: string;
-}
-
-/** Details payload on the batched `advisor` custom message rendered in the transcript. */
-export interface AdvisorMessageDetails {
-	notes: AdvisorNote[];
 }
 
 /**
@@ -56,12 +43,16 @@ const ADVISOR_GUIDANCE = "weigh, don't blindly obey";
  * non-interrupting YieldQueue dispatcher and the interrupting steer path so both
  * build byte-identical content.
  */
-export function formatAdvisorBatchContent(notes: readonly AdvisorNote[]): string {
+export function formatAdvisorBatchContent(notes: readonly AdvisorNote[], opts?: { currentTurn?: number }): string {
 	return notes
 		.map(n => {
 			const severity = n.severity ? ` severity="${n.severity}"` : "";
 			const who = n.advisor ? ` advisor="${escapeXmlAttribute(n.advisor)}"` : "";
-			return `<advisory${who}${severity} guidance="${ADVISOR_GUIDANCE}">\n${escapeXmlText(n.note)}\n</advisory>`;
+			const age =
+				opts?.currentTurn !== undefined && n.turn !== undefined && opts.currentTurn > n.turn
+					? ` turns_ago="${opts.currentTurn - n.turn}"`
+					: "";
+			return `<advisory${who}${severity}${age} guidance="${ADVISOR_GUIDANCE}">\n${escapeXmlText(n.note)}\n</advisory>`;
 		})
 		.join("\n");
 }
@@ -105,6 +96,9 @@ export function isAdvisorInterruptImmuneTurnActive(opts: {
  *   still steers a triggered turn to force the primary to acknowledge and continue
  *   before the turn is considered done (#5628) — deferring it to the next user
  *   turn is the bug.
+ *   `allowTerminalConcernSteering` opts out of ONLY this preservation branch
+ *   (a final-review continuation policy); stop/abort suppression, `preserveOnly`,
+ *   and the immune-turn cooldown below still run first and are never bypassed.
  * - After a deliberate user interrupt (`autoResumeSuppressed`) the advisor must
  *   not auto-resume the stopped run. While the agent is idle — or still tearing
  *   the interrupted turn down (`aborting`) — the note is preserved as a visible
@@ -124,11 +118,21 @@ export function resolveAdvisorDeliveryChannel(opts: {
 	streaming: boolean;
 	aborting: boolean;
 	terminalAnswerNoQueuedWork?: boolean;
+	/** Opt out of terminal-answer preservation for a late `concern` (default
+	 *  false). Bypasses ONLY that branch — never stop/abort suppression,
+	 *  `preserveOnly`, or the immune-turn cooldown. */
+	allowTerminalConcernSteering?: boolean;
 	interruptImmuneTurnActive?: boolean;
 	preserveOnly?: boolean;
 }): AdvisorDeliveryChannel {
 	if (opts.preserveOnly && !opts.streaming) return "preserve";
-	if (opts.terminalAnswerNoQueuedWork && opts.severity !== "blocker" && !opts.streaming && !opts.aborting)
+	if (
+		opts.terminalAnswerNoQueuedWork &&
+		opts.severity !== "blocker" &&
+		!opts.allowTerminalConcernSteering &&
+		!opts.streaming &&
+		!opts.aborting
+	)
 		return "preserve";
 	if (!isInterruptingSeverity(opts.severity)) return "aside";
 	if (opts.autoResumeSuppressed && (opts.aborting || !opts.streaming)) return "preserve";
@@ -177,36 +181,27 @@ function advisorSeverityRank(severity: AdvisorSeverity | undefined): number {
 }
 
 /**
- * Live admission: the guard accepted the note and handed it to the session's
- * delivery routing. That is the whole truthful claim — `onAdvice` is
- * synchronous void and MAY only buffer the note for a terminal-boundary flush
- * or preserve it as a card; no actual send or consumption acknowledgment
- * exists at this layer.
+ * Merged-batch ordering: most recent turn first, then severity (blocker →
+ * concern → nit) within a turn. The newest notes describe the latest state of
+ * the work, so they read first; severity breaks ties so a blocker never hides
+ * below a same-turn nit.
  */
-const ADVISOR_ACK_SENT = "Accepted for primary delivery.";
+export function compareAdvisorNotes(a: AdvisorNote, b: AdvisorNote): number {
+	const turnDelta = (b.turn ?? 0) - (a.turn ?? 0);
+	if (turnDelta !== 0) return turnDelta;
+	return advisorSeverityRank(b.severity) - advisorSeverityRank(a.severity);
+}
 
-/**
- * Deferred admission: the note holds a reservation behind an in-progress
- * primary turn and flushes automatically when the turn completes. The promise
- * is conditional on priority: a strictly-higher-severity note from the SAME
- * review may still displace it at a full budget. Truthful for both a fresh
- * reservation and a re-raise of an already-queued note.
- */
-const ADVISOR_ACK_DEFERRED =
-	"Deferred — primary is mid-turn; this note is queued for automatic delivery when the turn completes, " +
-	"unless a higher-severity note from the same review displaces it. Do not re-raise the same point.";
-
-/**
- * Rejections, keyed by the guard's suppression reason. A suppressed note is
- * never described as recorded, queued, or scheduled for delivery — the
- * advisor learns the note was dropped and why, so a rate-limited note is not
- * mislabeled a duplicate and a dropped deferred note is never promised.
- */
+/** Admission acks: one line each — the advisor needs the verdict, not a policy essay. */
+const ADVISOR_ACK_SENT = "Delivered.";
+/** Held behind the in-progress primary turn; flushed when it completes. */
+const ADVISOR_ACK_DEFERRED = "Queued for the end of the turn. Do not re-raise.";
+/** A suppressed note is never described as recorded or queued. */
 const ADVISOR_ACK_SUPPRESSED: Record<AdvisorSuppressionReason, string> = {
-	empty: "Not recorded — empty note.",
-	noise: "Not recorded — the note carries no concrete, actionable content.",
-	duplicate: "Duplicate advice ignored — this point was already raised.",
-	"rate-limit": "Not recorded — this update's non-blocker advice budget is spent; the note was dropped.",
+	empty: "Dropped: empty note.",
+	noise: "Dropped: nothing actionable.",
+	duplicate: "Dropped: already raised.",
+	"rate-limit": "Dropped: this update's advice budget is spent.",
 };
 
 export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails> {
@@ -223,6 +218,9 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 	 */
 	readonly #guard: AdvisorEmissionGuard;
 	#inProgressUpdate = false;
+	/** Primary-turn count the in-flight update reviews (stamped on emitted notes
+	 *  so merged batches can report how stale each review was at delivery). */
+	#coveredTurn: number | undefined;
 	/** Notes admitted but withheld while the primary was mid-turn, in arrival
 	 *  order. Flushed deterministically at the completed-update transition or an
 	 *  explicit {@link flushDeferredNotes}, so delivery does not depend on the
@@ -233,6 +231,7 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 		key: string;
 		note: string;
 		severity?: AdviseDetails["severity"];
+		turn?: number;
 	}[] = [];
 
 	/**
@@ -245,7 +244,7 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 	 *   {@link ADVISOR_DEFAULT_BUDGET_PER_UPDATE}).
 	 */
 	constructor(
-		private readonly onAdvice: (note: string, severity?: AdviseDetails["severity"]) => void,
+		private readonly onAdvice: (note: string, severity: AdviseDetails["severity"] | undefined, turn?: number) => void,
 		guard?: AdvisorEmissionGuard,
 	) {
 		this.#guard = guard ?? new AdvisorEmissionGuard();
@@ -260,9 +259,10 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 	 * was admitted when emitted, so the flush routes without re-admission and a
 	 * backlog of one note per originating update reaches the primary intact.
 	 */
-	beginUpdate(inProgress: boolean): void {
+	beginUpdate(inProgress: boolean, coveredTurn?: number): void {
 		const wasInProgress = this.#inProgressUpdate;
 		this.#inProgressUpdate = inProgress;
+		this.#coveredTurn = coveredTurn;
 		this.#guard.beginUpdate();
 		if (wasInProgress && !inProgress) this.#flushDeferred();
 	}
@@ -320,7 +320,7 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 				const displacedIndex = this.#deferredNotes.findIndex(item => item.key === decision.displacedKey);
 				if (displacedIndex !== -1) this.#deferredNotes.splice(displacedIndex, 1);
 			}
-			this.#deferredNotes.push({ key, note: args.note, severity: args.severity });
+			this.#deferredNotes.push({ key, note: args.note, severity: args.severity, turn: this.#coveredTurn });
 			return this.#result(ADVISOR_ACK_DEFERRED, args);
 		}
 		// Live path (completed update, or a blocker that must interrupt now). A
@@ -332,7 +332,7 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 		if (reservedIndex !== -1) this.#deferredNotes.splice(reservedIndex, 1);
 		const decision = this.#guard.admit(args.note, { rank, pending: false });
 		if (!decision.accepted) return this.#suppressed(args, decision.reason);
-		this.onAdvice(args.note, args.severity);
+		this.onAdvice(args.note, args.severity, this.#coveredTurn);
 		return this.#result(ADVISOR_ACK_SENT, args);
 	}
 
@@ -343,9 +343,9 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 		if (this.#deferredNotes.length === 0) return;
 		const pending = this.#deferredNotes;
 		this.#deferredNotes = [];
-		for (const { note, severity } of pending) {
+		for (const { note, severity, turn } of pending) {
 			this.#guard.markRouted(note);
-			this.onAdvice(note, severity);
+			this.onAdvice(note, severity, turn ?? this.#coveredTurn);
 		}
 	}
 

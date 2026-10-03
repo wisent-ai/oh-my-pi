@@ -1,5 +1,6 @@
 import { encodeSixel } from "@oh-my-pi/pi-natives";
 import { $env, isBunTestRuntime, isTerminalHeadless, isWsl } from "@oh-my-pi/pi-utils/env";
+import { writeTerminalSequence } from "./active-terminal";
 import { sendDesktopNotification, shouldDeliverDesktopNotification } from "./desktop-notify";
 import {
 	detectKittyUnicodePlaceholdersSupport,
@@ -10,7 +11,7 @@ import {
 	setKittyGraphics,
 } from "./kitty-graphics";
 import { isInsideHerdr, isInsideTerminalMultiplexer } from "./terminal-multiplexer";
-import { isInsideTmux, wrapTmuxPassthrough, wrapTmuxPassthroughIfNeeded } from "./tmux";
+import { isInsideTmux, resolveTmuxClientTerminalName, wrapTmuxPassthrough, wrapTmuxPassthroughIfNeeded } from "./tmux";
 import type { HangulCompatibilityJamoWidth } from "./utils";
 
 export * from "./terminal-multiplexer";
@@ -37,10 +38,14 @@ export type TerminalId =
 	| "alacritty"
 	| "warp"
 	| "orca"
+	| "otty"
+	| "rio"
+	| "tern"
+	| "monstar"
 	| "base"
 	| "trueColor";
 
-const CMUX_NOTIFICATION_TITLE = "Oh My Pi";
+const CMUX_NOTIFICATION_TITLE = "omp";
 const CMUX_SURFACE_ID_PATTERN = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/iu;
 
 /** Title and body for an out-of-band multiplexer notification (cmux, Herdr). */
@@ -248,17 +253,17 @@ export class TerminalInfo {
 		// has that the agent finished or is waiting for input. `Bell` protocol
 		// already self-flags via tmux's bell monitoring, so leave it alone.
 		if (this.notifyProtocol !== NotifyProtocol.Bell && isInsideTmux()) {
-			process.stdout.write(`${wrapTmuxPassthrough(formatted)}\x07`);
+			writeTerminalSequence(`${wrapTmuxPassthrough(formatted)}\x07`);
 			return;
 		}
 		// Zellij drops OSC 9/99 and has no DCS passthrough envelope, but raises its
 		// `[!]` bell flag on a bare BEL — the same backgrounded-pane signal tmux
 		// users get. So follow the (Zellij-swallowed) OSC with a plain BEL.
 		if (this.notifyProtocol !== NotifyProtocol.Bell && isInsideZellij()) {
-			process.stdout.write(`${formatted}\x07`);
+			writeTerminalSequence(`${formatted}\x07`);
 			return;
 		}
-		process.stdout.write(formatted);
+		writeTerminalSequence(formatted);
 		// VTE-family terminals (Ptyxis, GNOME Terminal, Tilix, …) plus Alacritty
 		// and bare xterm-on-Wayland have no in-band escape that surfaces an
 		// arbitrary desktop toast (#3685). When the chosen `notifyProtocol` is
@@ -278,6 +283,14 @@ export class TerminalInfo {
  */
 export function isInsideZellij(env: NodeJS.ProcessEnv = Bun.env): boolean {
 	return Boolean(env.ZELLIJ);
+}
+
+/**
+ * Whether the agent process runs in an SSH session, so the terminal emulator
+ * is remote and host-local input/keyboard modes cannot be assumed.
+ */
+export function isSshSession(env: NodeJS.ProcessEnv = Bun.env): boolean {
+	return Boolean(env.SSH_CONNECTION || env.SSH_TTY || env.SSH_CLIENT);
 }
 
 export function isNotificationSuppressed(): boolean {
@@ -402,6 +415,7 @@ export function shouldEnableSynchronizedOutputByDefault(
 	switch (terminalId) {
 		case "kitty":
 		case "ghostty":
+		case "monstar":
 		case "wezterm":
 		case "iterm2":
 		case "alacritty":
@@ -467,6 +481,7 @@ export function detectStyledUnderlineSupport(terminalId: TerminalId, env: NodeJS
 	switch (terminalId) {
 		case "kitty":
 		case "ghostty":
+		case "monstar":
 		case "wezterm":
 			return true;
 		case "iterm2": {
@@ -512,11 +527,15 @@ function parseTmuxVersionFromEnv(env: NodeJS.ProcessEnv): { major: number; minor
  * Policy (highest precedence first):
  *   1. Explicit user override (`PI_NO_HYPERLINKS=1` off, `PI_FORCE_HYPERLINKS=1`
  *      on). Opt-out wins ties.
- *   2. Static terminal capability — terminals whose {@link TerminalInfo} marks
+ *   2. Herdr pane with no nested screen/tmux: on. Herdr hides the outer
+ *      terminal (`TERM=xterm-256color`, no `TERM_PROGRAM`), but it renders
+ *      OSC 8 in its own grid and opens links itself on Ctrl+click, so the
+ *      outer terminal's support does not matter.
+ *   3. Static terminal capability — terminals whose {@link TerminalInfo} marks
  *      `hyperlinks: false` (e.g. `base`) stay off unless the user forced on.
- *   3. GNU screen's explicit session marker (`STY`) always off, even if tmux is
+ *   4. GNU screen's explicit session marker (`STY`) always off, even if tmux is
  *      also present: a screen layer anywhere in the path cannot forward OSC 8.
- *   4. tmux session (`TMUX` set): enabled when tmux self-reports >= 3.4 via
+ *   5. tmux session (`TMUX` set): enabled when tmux self-reports >= 3.4 via
  *      `TERM_PROGRAM_VERSION` (tmux 3.4 stores OSC 8 as a cell attribute and
  *      forwards it to outer terminals whose `terminal-features` include
  *      `hyperlinks`). Older or unknown versions stay off; on outer terminals
@@ -524,11 +543,11 @@ function parseTmuxVersionFromEnv(env: NodeJS.ProcessEnv): { major: number; minor
  *      identical to today. Checked before the screen-family TERM heuristic
  *      because tmux's historical `default-terminal` is `screen-256color`, so
  *      `TERM=screen*` inside a tmux session must NOT short-circuit to off.
- *   5. screen-family TERM without `TMUX` always off: screen never gained OSC 8
+ *   6. screen-family TERM without `TMUX` always off: screen never gained OSC 8
  *      support.
- *   6. tmux-family TERM without `TMUX` env — unusual (e.g. inspection scripts);
+ *   7. tmux-family TERM without `TMUX` env — unusual (e.g. inspection scripts);
  *      no version available, so off.
- *   7. Otherwise honor the static terminal capability.
+ *   8. Otherwise honor the static terminal capability.
  */
 export function shouldEnableHyperlinksByDefault(
 	env: NodeJS.ProcessEnv = Bun.env,
@@ -536,6 +555,8 @@ export function shouldEnableHyperlinksByDefault(
 ): boolean {
 	const override = hyperlinksUserOverride(env);
 	if (override !== null) return override;
+
+	if (isInsideHerdr(env) && !env.STY && !env.TMUX) return true;
 
 	if (!getTerminalInfo(terminalId).hyperlinks) return false;
 
@@ -669,12 +690,68 @@ const KNOWN_TERMINALS = Object.freeze({
 	// honor OSC 8 yet (the escape renders as visible text), so hyperlinks stay off,
 	// but it does support OSC 9 notifications.
 	warp: new TerminalInfo("warp", ImageProtocol.Kitty, true, false, NotifyProtocol.Osc9, false, false, false, 1),
+	// Otty (appmakes, macOS) identifies via TERM_PROGRAM=otty. Its documented
+	// Kitty implementation covers direct and virtual (U+10EEEE placeholder)
+	// placement, and it honors OSC 8 hyperlinks and OSC 99 notifications
+	// (docs.otty.sh terminal comparison). Sixel is not implemented, DECCARA and
+	// OSC 66 text sizing are unverified, so those stay on conservative defaults;
+	// synchronized output is left to the runtime DECRQM probe.
+	otty: new TerminalInfo("otty", ImageProtocol.Kitty, true, true, NotifyProtocol.Osc99),
+	// rio publishes its supported escape sequences at
+	// rioterm.com/docs/escape-sequence-support: OSC 8 hyperlinks are opened via
+	// the hints system (Alt+click on Windows/Linux) — live-verified on
+	// rio 0.5.28/Win11 26100 where an OSC 8 span Alt+click opened the target
+	// URL in the browser, and an OSC 52 clipboard query round-tripped. Kitty
+	// graphics direct placement plus U=1 Unicode placeholders verified by the
+	// reporter (#12205). Notifications stay on BEL: rio parses OSC 9/777 into
+	// its own notifier, but its Windows path raises an unpackaged WinRT toast
+	// with AppId "Rio" that Windows silently drops without a registered AUMID
+	// shortcut — observed as a no-op live — so flipping it would only remove
+	// the D-Bus fallback for Linux rio users. DECCARA, screen-to-scrollback,
+	// OSC 99, and OSC 66 text sizing are outside rio's supported set and keep
+	// the conservative defaults.
+	rio: new TerminalInfo("rio", ImageProtocol.Kitty, true, true),
+	// Tern (Stencil's terminal, `stencil-term`) sets TERM_PROGRAM=tern and
+	// implements Kitty graphics, OSC 8 and OSC 9/99 notifications. Whether omp
+	// renders natively (Tern Surface Protocol) is decided by the `hello`
+	// handshake alone, never by this identity.
+	tern: new TerminalInfo("tern", ImageProtocol.Kitty, true, true, NotifyProtocol.Osc99),
+	// Monstar (rockorager/monstar) is a Wayland terminal built on libghostty. It
+	// sets TERM=monstar and answers XTVERSION with `monstar <version>`. It
+	// documents Kitty graphics with Unicode placeholders, OSC 8 hyperlinks, and
+	// synchronized output. libghostty reports Hangul Jamo as 2 cells, and the
+	// Monstar renderer draws curly underlines in the SGR 58 underline color, so
+	// the id-keyed allowlists treat Monstar like Ghostty.
+	// Monstar clears OSC 9;4 progress after 15 s without an update, so it also
+	// gets the Ghostty progress keepalive. The Ghostty initial image delay stays
+	// Ghostty-only: it works around a Ghostty app startup race, not libghostty.
+	// Monstar turns OSC 9 into a D-Bus notification with a default action;
+	// activating it focuses the Monstar window. The BEL path uses omp's own
+	// `notify-send` fallback instead, which cannot focus a window.
+	monstar: new TerminalInfo("monstar", ImageProtocol.Kitty, true, true, NotifyProtocol.Osc9, false, false, false, 2),
 });
 
 /** Resolve terminal identity from environment markers used by common emulators. */
 export function detectTerminalId(env: NodeJS.ProcessEnv = Bun.env): TerminalId {
 	function caseEq(a: string, b: string): boolean {
 		return a.toLowerCase() === b.toLowerCase(); // For compiler to pattern match
+	}
+
+	function fromProgram(program: string | undefined): TerminalId | null {
+		if (!program) return null;
+		if (caseEq(program, "kitty")) return "kitty";
+		if (caseEq(program, "ghostty")) return "ghostty";
+		if (caseEq(program, "wezterm")) return "wezterm";
+		if (caseEq(program, "iterm.app") || caseEq(program, "iterm2")) return "iterm2";
+		if (caseEq(program, "vscode")) return "vscode";
+		if (caseEq(program, "alacritty")) return "alacritty";
+		if (caseEq(program, "warpterminal")) return "warp";
+		if (caseEq(program, "orca")) return "orca";
+		if (caseEq(program, "otty")) return "otty";
+		if (caseEq(program, "rio")) return "rio";
+		if (caseEq(program, "tern")) return "tern";
+		if (caseEq(program, "monstar")) return "monstar";
+		return null;
 	}
 
 	const {
@@ -696,18 +773,16 @@ export function detectTerminalId(env: NodeJS.ProcessEnv = Bun.env): TerminalId {
 	if (VSCODE_PID) return "vscode";
 	if (ALACRITTY_WINDOW_ID) return "alacritty";
 
-	if (TERM_PROGRAM) {
-		if (caseEq(TERM_PROGRAM, "kitty")) return "kitty";
-		if (caseEq(TERM_PROGRAM, "ghostty")) return "ghostty";
-		if (caseEq(TERM_PROGRAM, "wezterm")) return "wezterm";
-		if (caseEq(TERM_PROGRAM, "iterm.app")) return "iterm2";
-		if (caseEq(TERM_PROGRAM, "vscode")) return "vscode";
-		if (caseEq(TERM_PROGRAM, "alacritty")) return "alacritty";
-		if (caseEq(TERM_PROGRAM, "warpterminal")) return "warp";
-		if (caseEq(TERM_PROGRAM, "orca")) return "orca";
-	}
+	const programId = fromProgram(TERM_PROGRAM);
+	if (programId) return programId;
+
+	// tmux >= 3.2 replaces the pane's identity with `TERM_PROGRAM=tmux`.
+	// Its server still holds the attached client's terminal-type reply.
+	const clientProgramId = fromProgram(resolveTmuxClientTerminalName(env) ?? undefined);
+	if (clientProgramId) return clientProgramId;
 
 	if (TERM?.toLowerCase().includes("ghostty")) return "ghostty";
+	if (TERM && caseEq(TERM, "monstar")) return "monstar";
 
 	if (COLORTERM) {
 		if (caseEq(COLORTERM, "truecolor") || caseEq(COLORTERM, "24bit")) return "trueColor";
@@ -732,6 +807,12 @@ export interface RuntimeTerminal extends TerminalInfo {
 	textSizing: boolean;
 	/** Whether the terminal implements colon-subparameter styled underlines (curly + colored). */
 	styledUnderlines: boolean;
+	/**
+	 * Whether the terminal answered the Glyph Protocol support query with a
+	 * `glyf`-capable reply and the bundled icons have been registered. Probe-
+	 * driven: false until {@link ProcessTerminal} resolves it.
+	 */
+	glyphProtocol: boolean;
 }
 
 export const TERMINAL: RuntimeTerminal = (() => {
@@ -763,11 +844,12 @@ export const TERMINAL: RuntimeTerminal = (() => {
 	// depth), so Apple Terminal and other unproven hosts fall back to the flat
 	// CSI 4 m / CSI 24 m underline the typo renderer needs to avoid black bars.
 	resolved.styledUnderlines = detectStyledUnderlineSupport(resolved.id, Bun.env);
+	resolved.glyphProtocol = false;
 	return resolved;
 })();
 
 // Seed Kitty Unicode placeholder support from the resolved terminal id. Only
-// kitty/ghostty are known to honor `U=1` placement; other Kitty-protocol paths
+// kitty/ghostty/otty are known to honor `U=1` placement; other Kitty-protocol paths
 // (wezterm, tmux/screen fallback) treat the placeholder cells as literal PUA
 // glyphs, which is the "ASCII artifact + laggy scrolling" reported in #1877.
 setKittyGraphics({ unicodePlaceholders: detectKittyUnicodePlaceholdersSupport(TERMINAL.id, Bun.env) });
@@ -786,6 +868,11 @@ export function setTerminalImageProtocol(imageProtocol: ImageProtocol | null): v
  */
 export function setTerminalDeccara(enabled: boolean): void {
 	TERMINAL.deccara = enabled;
+}
+
+/** Record the Glyph Protocol probe result (called by ProcessTerminal). */
+export function setTerminalGlyphProtocol(supported: boolean): void {
+	TERMINAL.glyphProtocol = supported;
 }
 
 /** Override screen-to-scrollback clear support for targeted renderer tests. */
@@ -1386,7 +1473,7 @@ function notificationToLine(n: TerminalNotification): string {
 // C0/C1 control characters that are unsafe inside an OSC payload (must base64).
 const OSC99_UNSAFE = /[\x00-\x1f\x7f\x80-\x9f]/u;
 const OSC99_MAX_PAYLOAD_BYTES = 2048;
-const OSC99_APP_NAME = "Oh My Pi";
+const OSC99_APP_NAME = "omp";
 let nextOsc99NotificationId = 1;
 
 function base64Utf8(value: string): string {

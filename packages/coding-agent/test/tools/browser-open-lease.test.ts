@@ -17,7 +17,8 @@ import { CmuxSocketClient } from "@oh-my-pi/pi-coding-agent/tools/browser/cmux/s
 import * as registry from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import { getTabsMapForTest, releaseTab } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
-import { ToolAbortError, ToolError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
+import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
 function makeSession(): ToolSession {
 	return {
@@ -28,6 +29,8 @@ function makeSession(): ToolSession {
 		settings: Settings.isolated({
 			"browser.enabled": true,
 			"browser.cmux": true,
+			// Tern resolves before cmux; keep an ambient Tern pane from capturing the open.
+			"browser.tern": false,
 			"tools.maxTimeout": 0,
 		}),
 		getSessionId: () => "session-open-lease",

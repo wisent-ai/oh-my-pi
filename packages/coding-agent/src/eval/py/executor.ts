@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 
 import { getProjectDir, logger, Snowflake } from "@oh-my-pi/pi-utils";
-import type { OutputArtifactError } from "../../session/streaming-output";
+import type { OutputArtifactError } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import type { ToolSession } from "../../tools";
 import {
 	buildManagedKernelEnv,
@@ -60,6 +60,8 @@ export interface PythonToolInvokeOptions {
 export interface PythonExecutorOptions {
 	/** Working directory for command execution */
 	cwd?: string;
+	/** Source filename for file-backed execution and tracebacks. */
+	filename?: string;
 	/** Timeout in milliseconds */
 	timeoutMs?: number;
 	/** Absolute wall-clock deadline in milliseconds since epoch */
@@ -147,6 +149,8 @@ export interface PythonResult {
 	truncated: boolean;
 	/** Artifact ID if full output was saved to artifact storage */
 	artifactId?: string;
+	/** Bytes the artifact cap dropped from the saved file's middle (the artifact is a head/tail sample). */
+	artifactElidedBytes?: number;
 	artifactError?: OutputArtifactError;
 	/** Total number of lines in the output stream */
 	totalLines: number;

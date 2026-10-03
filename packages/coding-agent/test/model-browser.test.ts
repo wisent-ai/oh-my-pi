@@ -1,3 +1,4 @@
+import { createModelBrowserSource } from "../src/modes/model-browser-source";
 import { beforeAll, describe, expect, test } from "bun:test";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
@@ -5,16 +6,19 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	buildBrowserItems,
+	buildSearchAffinity,
+	rankModelItems,
 	ModelBrowser,
 	type RoleAssignments,
 	resolveRoleAssignments,
 	sortModelItems,
-} from "@oh-my-pi/pi-coding-agent/modes/components/model-browser";
-import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+} from "@oh-my-pi/pi-tui/overlays/model-browser";
+import { initTheme, theme } from "@oh-my-pi/pi-tui/theme";
+import { createModelMentionSource } from "@oh-my-pi/pi-tui/prompt/model-mention-autocomplete";
 
 /** Optional presentation metadata a catalog or discovery source may attach. */
 type NativeMetadata = Pick<Model, "description" | "isNew" | "isBeta" | "isRecommended" | "int" | "tps"> &
-	Partial<Pick<Model, "cost">>;
+	Partial<Pick<Model, "cost" | "kind" | "pricingStatus">>;
 
 function makeModel(provider: string, id: string, metadata?: NativeMetadata): Model {
 	return buildModel({
@@ -38,7 +42,9 @@ function makeBrowser(
 	mruOrder: string[],
 	options: { roles?: RoleAssignments; providerOrder?: string[] } = {},
 ): ModelBrowser {
-	const browser = new ModelBrowser(Settings.isolated({ modelProviderOrder: options.providerOrder ?? [] }));
+	const browser = new ModelBrowser(
+		createModelBrowserSource(Settings.isolated({ modelProviderOrder: options.providerOrder ?? [] })),
+	);
 	const items = buildBrowserItems(models);
 	sortModelItems(items, { mruOrder });
 	browser.setRoles(options.roles ?? {});
@@ -48,6 +54,22 @@ function makeBrowser(
 }
 
 describe("resolveRoleAssignments", () => {
+	test("rejects configured models that do not match the role's accepted kind", () => {
+		const chat = makeModel("demo", "chat");
+		const image = makeModel("demo", "image", { kind: "image" });
+		const settings = Settings.isolated({
+			modelRoles: {
+				default: "demo/image",
+				image: "demo/image",
+			},
+		});
+
+		const roles = resolveRoleAssignments(createModelBrowserSource(settings), [chat, image], [chat, image]);
+
+		expect(roles.default).toBeUndefined();
+		expect(roles.image?.model).toBe(image);
+	});
+
 	test("shows configured smol for an unconfigured tiny role", () => {
 		const smol = makeModel("demo", "custom-smol");
 		const priorityHead = makeModel("demo", "gemini-3.8-flash");
@@ -58,7 +80,11 @@ describe("resolveRoleAssignments", () => {
 			},
 		});
 
-		const roles = resolveRoleAssignments(settings, [smol, priorityHead], [smol, priorityHead]);
+		const roles = resolveRoleAssignments(
+			createModelBrowserSource(settings),
+			[smol, priorityHead],
+			[smol, priorityHead],
+		);
 
 		expect(roles.smol?.model).toBe(smol);
 		expect(roles.tiny?.model).toBe(smol);
@@ -75,7 +101,11 @@ describe("resolveRoleAssignments", () => {
 			},
 		});
 
-		const roles = resolveRoleAssignments(settings, [slow, priorityHead], [slow, priorityHead]);
+		const roles = resolveRoleAssignments(
+			createModelBrowserSource(settings),
+			[slow, priorityHead],
+			[slow, priorityHead],
+		);
 
 		expect(roles.slow?.model).toBe(slow);
 		expect(roles.advisor?.model).toBe(slow);
@@ -83,7 +113,49 @@ describe("resolveRoleAssignments", () => {
 	});
 });
 
+describe("createModelMentionSource", () => {
+	test("refreshes candidates when role settings or availability change between queries", () => {
+		const a = makeModel("a", "example-2");
+		const b = makeModel("b", "example-2");
+		const available = [a, b];
+		const settings = Settings.isolated({ modelRoles: { default: "b/example-2" } });
+		const candidates = createModelMentionSource({
+			source: createModelBrowserSource(settings),
+			registry: { getError: () => undefined, getAvailable: () => [...available], getAll: () => [...available] },
+			scopedModels: () => [],
+		});
+		const selectors = (query: string) => candidates(query).map(item => item.selector);
+
+		expect(selectors("example")).toEqual(["b/example-2", "a/example-2"]);
+
+		settings.setModelRole("default", "a/example-2");
+		expect(selectors("example")).toEqual(["a/example-2", "b/example-2"]);
+
+		available.push(makeModel("c", "example-3"));
+		expect(selectors("example")).toContain("c/example-3");
+	});
+});
+
 describe("ModelBrowser search ranking", () => {
+	test("headless candidates preserve picker relevance and affinity ordering", () => {
+		const models = [makeModel("a", "example-2"), makeModel("b", "example-2"), makeModel("a", "other")];
+		const roles: RoleAssignments = {};
+		const mruOrder = ["b/example-2", "a/example-2"];
+		const providerOrder = ["a"];
+		const browser = makeBrowser(models, mruOrder, { roles, providerOrder });
+		const query = "example";
+		browser.setQuery(query);
+		const items = buildBrowserItems(models);
+		const ranked = rankModelItems(query, items, {
+			roles,
+			mruOrder,
+			affinity: buildSearchAffinity(providerOrder, roles, mruOrder),
+		});
+		expect(ranked.map(item => item.selector)).toEqual(["b/example-2", "a/example-2"]);
+		expect(browser.getSelected()?.selector).toBe(ranked[0].selector);
+		expect(ranked.length).toBe(browser.visibleCount);
+	});
+
 	test("an exact query match outranks the MRU model", () => {
 		// Regression: with gpt-5.6-sol as the active (MRU) model, typing
 		// "gpt-5.5" must select gpt-5.5, not keep the MRU pinned on top.
@@ -243,7 +315,7 @@ describe("ModelBrowser perf display", () => {
 	});
 
 	function makePerfBrowser(): ModelBrowser {
-		const browser = new ModelBrowser(Settings.isolated({}));
+		const browser = new ModelBrowser(createModelBrowserSource(Settings.isolated({})));
 		browser.setItems(buildBrowserItems([makeModel("openai", "gpt-5")]));
 		browser.setPerfStats(new Map([["openai/gpt-5", { samples: 12, tps: 118.4, ttftMs: 930 }]]));
 		return browser;
@@ -262,6 +334,29 @@ describe("ModelBrowser perf display", () => {
 		expect(wideRow).toContain("0.9s 118t/s");
 	});
 
+	test("narrow rows drop cost, then context, before truncating the model name", () => {
+		const model = makeModel("openai", "gpt-5-codex-mini");
+		model.cost.input = 100;
+		model.contextWindow = 128_000;
+		model.cost.output = 0.001;
+		const browser = new ModelBrowser(createModelBrowserSource(Settings.isolated({})));
+		browser.setItems(buildBrowserItems([model]));
+
+		const wide = renderPlain(browser, 100)[2];
+		expect(wide).toContain("gpt-5-codex-mini");
+		expect(wide).toContain("128k");
+		expect(wide).toContain("$100/0.001");
+
+		const narrow = renderPlain(browser, 34)[2];
+		expect(narrow).toContain("gpt-5-codex-mini");
+		expect(narrow).toContain("128k");
+		expect(narrow).not.toContain("$100");
+
+		const tiny = renderPlain(browser, 16)[2];
+		expect(tiny).toContain("gpt-5");
+		expect(tiny).not.toContain("128k");
+	});
+
 	test("detail line shows measured perf regardless of width", () => {
 		const browser = makePerfBrowser();
 
@@ -270,7 +365,7 @@ describe("ModelBrowser perf display", () => {
 	});
 
 	test("catalog metrics render an intelligence tab and estimated TPS when unmeasured", () => {
-		const browser = new ModelBrowser(Settings.isolated({}));
+		const browser = new ModelBrowser(createModelBrowserSource(Settings.isolated({})));
 		browser.setItems(buildBrowserItems([makeModel("openai", "gpt-5", { int: 45.2, tps: 82.5 })]));
 
 		const lines = renderPlain(browser, 120);
@@ -280,7 +375,7 @@ describe("ModelBrowser perf display", () => {
 	});
 
 	test("measured TPS takes precedence over the catalog estimate", () => {
-		const browser = new ModelBrowser(Settings.isolated({}));
+		const browser = new ModelBrowser(createModelBrowserSource(Settings.isolated({})));
 		browser.setItems(buildBrowserItems([makeModel("openai", "gpt-5", { int: 45.2, tps: 82.5 })]));
 		browser.setPerfStats(new Map([["openai/gpt-5", { samples: 12, tps: 118.4, ttftMs: 930 }]]));
 
@@ -290,7 +385,7 @@ describe("ModelBrowser perf display", () => {
 	});
 
 	test("models without measurements or catalog metrics render no metric cells", () => {
-		const browser = new ModelBrowser(Settings.isolated({}));
+		const browser = new ModelBrowser(createModelBrowserSource(Settings.isolated({})));
 		browser.setItems(buildBrowserItems([makeModel("openai", "gpt-5")]));
 
 		const row = renderPlain(browser, 120)[2];
@@ -305,7 +400,7 @@ describe("ModelBrowser native model metadata", () => {
 	});
 
 	function renderDetail(model: Model): string {
-		const browser = new ModelBrowser(Settings.isolated({}));
+		const browser = new ModelBrowser(createModelBrowserSource(Settings.isolated({})));
 		browser.setItems(buildBrowserItems([model]));
 		const lines = browser.render(160).map(line => Bun.stripANSI(line));
 		return lines[lines.length - 2] as string;
@@ -313,7 +408,7 @@ describe("ModelBrowser native model metadata", () => {
 
 	test("detail line badges upstream flags and appends the provider blurb", () => {
 		const detail = renderDetail(
-			makeModel("devin", "swe-2", {
+			makeModel("fixture", "swe-2", {
 				description: "Fast\tagentic\ncoder",
 				isNew: true,
 				isBeta: true,
@@ -328,6 +423,33 @@ describe("ModelBrowser native model metadata", () => {
 
 	test("models without upstream metadata render the plain detail line", () => {
 		expect(renderDetail(makeModel("openai", "gpt-5"))).toContain("gpt-5 · 128k ctx · 1k out · free per M");
+	});
+
+	test("labels declared pricing states instead of calling the zero rate card free", () => {
+		// Published rates win over any declared state.
+		expect(
+			renderDetail(
+				makeModel("openai", "metered", {
+					cost: { input: 1.25, output: 10, cacheRead: 0.125, cacheWrite: 0 },
+					pricingStatus: "unknown",
+				}),
+			),
+		).toContain("$1.25/10 per M");
+		expect(renderDetail(makeModel("subscription", "included", { pricingStatus: "included" }))).toContain(
+			" · included",
+		);
+		expect(renderDetail(makeModel("fixture", "unpriced", { pricingStatus: "unknown" }))).toContain(
+			" · pricing unknown",
+		);
+
+		const variable = makeModel("cursor", "default", { pricingStatus: "variable" });
+		const browser = makeBrowser([variable], []);
+		const lines = browser.render(160).map(line => Bun.stripANSI(line));
+		expect(lines[2]).toContain("varies");
+		expect(lines[lines.length - 2]).toContain("price varies");
+		// A router priced per request is not free, so the `free` filter skips it.
+		browser.setQuery("free");
+		expect(browser.visibleCount).toBe(0);
 	});
 
 	test("price rows preserve free labels and identify invalid rates", () => {
@@ -358,7 +480,6 @@ describe("ModelBrowser native model metadata", () => {
 	});
 
 	test.each([
-		[-1, 0, "$?/0"],
 		[0, -1, "$0/?"],
 		[-1, -2, "$?/?"],
 	] as const)("renders invalid rates %s/%s with per-leg markers", (input, output, expected) => {
@@ -389,5 +510,36 @@ describe("ModelBrowser native model metadata", () => {
 		expect(detailRow).toContain("$100/0.001 per M");
 		expect(tinyRow).toContain("$0.0000001/0.001");
 		expect(rows.every(line => Bun.stringWidth(line) <= 100)).toBe(true);
+	});
+});
+
+describe("Factory Droid credits badge", () => {
+	beforeAll(async () => {
+		await initTheme(false);
+	});
+
+	/** A Factory Droid row: upstream list price as `cost`, the base Standard Credits rate as the badge. */
+	function makeDroidModel(id: string, credits: number): Model {
+		return {
+			...makeModel("factory-droid", id),
+			cost: { input: 1.25, output: 10, cacheRead: 0, cacheWrite: 0 },
+			factoryDroidCredits: credits,
+		};
+	}
+
+	test("shows list price with the credit badge and never advertises unknown list prices as free", () => {
+		const priced = makeDroidModel("claude-opus-5", 2);
+		const paid = makeDroidModel("preview-credit-model", 2);
+		paid.cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+		const browser = makeBrowser([priced, paid], []);
+		const rows = browser.render(120).map(line => Bun.stripANSI(line));
+		const pricedRow = rows.find(row => row.includes("claude-opus-5"));
+		const paidRow = rows.find(row => row.includes("preview-credit-model"));
+
+		expect(pricedRow).toContain("$1.25/10 2×");
+		expect(paidRow).toContain("2×");
+		expect(paidRow).not.toContain("free");
+		browser.setQuery("free");
+		expect(browser.visibleCount).toBe(0);
 	});
 });

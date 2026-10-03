@@ -2,10 +2,18 @@
 
 use futures::FutureExt;
 mod completion;
+#[cfg(windows)]
+mod windows;
+
 use completion::{CompletionMarker, completion_exit_code, wait_with_output};
+use std::sync::Arc;
 
 #[cfg(windows)]
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+use std::os::windows::io::{AsRawHandle, OwnedHandle};
+#[cfg(windows)]
+use windows::{duplicate_handle, terminate_process_id, terminate_raw_handle};
+#[cfg(windows)]
+pub use windows::{process_handle_is_running, terminate_process_handle};
 
 use tokio_util::sync::CancellationToken;
 
@@ -27,8 +35,10 @@ pub struct ChildProcess {
 	reaped:      bool,
 	/// If available, the process ID of the child.
 	pid:         Option<sys::process::ProcessId>,
-	/// If available, the process group ID of the child.
+	/// If available, the shared process group ID of the pipeline.
 	pgid:        Option<sys::process::ProcessId>,
+	/// Every external process in this pipeline.
+	stop_pids:   Option<Arc<[sys::process::ProcessId]>>,
 	/// Windows handle duplicated from the child process for safe termination.
 	#[cfg(windows)]
 	kill_handle: Option<OwnedHandle>,
@@ -49,6 +59,7 @@ impl ChildProcess {
 			exec_future: Box::pin(wait_with_output(child)),
 			pid,
 			pgid,
+			stop_pids: None,
 			reaped: false,
 			#[cfg(windows)]
 			kill_handle,
@@ -64,6 +75,11 @@ impl ChildProcess {
 	/// Returns the process's group ID.
 	pub const fn pgid(&self) -> Option<sys::process::ProcessId> {
 		self.pgid
+	}
+
+	/// Sets the external process IDs that form this pipeline's stop scope.
+	pub(crate) fn set_stop_pids(&mut self, pids: Arc<[sys::process::ProcessId]>) {
+		self.stop_pids = Some(pids);
 	}
 
 	/// Duplicates the process handle for termination use on Windows.
@@ -83,6 +99,18 @@ impl ChildProcess {
 			Some(CompletionMarker { output, end_marker_prefix, end_marker_suffix });
 	}
 
+	/// Checks whether this process, or a stage in its pipeline, stopped.
+	fn poll_for_stop(&self) -> Result<bool, error::Error> {
+		let Some(pid) = self.pid else {
+			return Ok(false);
+		};
+		let pids = self
+			.stop_pids
+			.as_deref()
+			.unwrap_or_else(|| std::slice::from_ref(&pid));
+		sys::signal::poll_for_stopped_processes(pids, self.pgid)
+	}
+
 	/// Waits for the process to exit.
 	///
 	/// If a cancellation token is provided and triggered, the process will be killed.
@@ -94,6 +122,15 @@ impl ChildProcess {
 		let mut sigtstp = sys::signal::tstp_signal_listener()?;
 		#[allow(unused_mut, reason = "only mutated on some platforms")]
 		let mut sigchld = sys::signal::chld_signal_listener()?;
+
+		// A SIGCHLD delivered before the subscription above never reaches
+		// `sigchld`. Pipeline stages are all spawned before the first is
+		// waited on, so this process or one in its pipeline can stop before
+		// this point. Exits need no such check: the child's exec future
+		// registered for them when it was spawned.
+		if self.poll_for_stop()? {
+			return Ok(ProcessWaitResult::Stopped);
+		}
 
 		let cancelled = async {
 			match &cancel_token {
@@ -122,7 +159,7 @@ impl ChildProcess {
 					break Ok(ProcessWaitResult::Stopped)
 				},
 				_ = sigchld.recv() => {
-					if sys::signal::poll_for_stopped_children()? {
+					if self.poll_for_stop()? {
 						break Ok(ProcessWaitResult::Stopped);
 					}
 				},
@@ -189,93 +226,6 @@ impl Drop for ChildProcess {
 		self.kill();
 	}
 }
-
-#[cfg(windows)]
-fn duplicate_handle(handle: RawHandle) -> Option<OwnedHandle> {
-	use windows_sys::Win32::{
-		Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle},
-		System::Threading::GetCurrentProcess,
-	};
-
-	// SAFETY: GetCurrentProcess returns a pseudo-handle for the current process
-	// and has no preconditions.
-	let current = unsafe { GetCurrentProcess() };
-	let mut out_handle = std::ptr::null_mut();
-	// SAFETY: `current` is a valid current-process pseudo-handle, `handle` is
-	// an OS process handle owned by Tokio's child process object, and
-	// `out_handle` is a valid out pointer checked below before ownership is
-	// transferred to OwnedHandle.
-	let ok = unsafe {
-		DuplicateHandle(
-			current,
-			handle,
-			current,
-			&mut out_handle,
-			0,
-			0,
-			DUPLICATE_SAME_ACCESS,
-		)
-	};
-	if ok == 0 || out_handle.is_null() {
-		return None;
-	}
-
-	// SAFETY: DuplicateHandle succeeded and returned a non-null owned duplicate
-	// in `out_handle`, so transferring ownership to OwnedHandle is valid.
-	Some(unsafe { OwnedHandle::from_raw_handle(out_handle) })
-}
-
-#[cfg(windows)]
-fn terminate_raw_handle(handle: RawHandle) -> bool {
-	use windows_sys::Win32::System::Threading::TerminateProcess;
-
-	// SAFETY: The caller provides a process handle opened/duplicated for process
-	// termination. The handle remains owned by its original owner.
-	unsafe { TerminateProcess(handle, 1) != 0 }
-}
-
-/// Checks whether a duplicated Windows process handle still refers to a running process.
-#[cfg(windows)]
-#[must_use]
-pub fn process_handle_is_running(handle: &OwnedHandle) -> bool {
-	use windows_sys::Win32::{
-		Foundation::WAIT_TIMEOUT,
-		System::Threading::WaitForSingleObject,
-	};
-
-	// SAFETY: `handle` is a live duplicated process handle with synchronization access.
-	unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) == WAIT_TIMEOUT }
-}
-
-/// Terminates the process referenced by a duplicated Windows process handle.
-#[cfg(windows)]
-#[must_use]
-pub fn terminate_process_handle(handle: &OwnedHandle) -> bool {
-	terminate_raw_handle(handle.as_raw_handle())
-}
-
-#[cfg(windows)]
-fn terminate_process_id(pid: sys::process::ProcessId) -> bool {
-	use windows_sys::Win32::Foundation::CloseHandle;
-	use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE};
-
-	let Ok(pid) = u32::try_from(pid) else {
-		return false;
-	};
-
-	// SAFETY: OpenProcess is called with PROCESS_TERMINATE for a numeric process id.
-	// A null handle is handled below.
-	let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-	if handle.is_null() {
-		return false;
-	}
-
-	let terminated = terminate_raw_handle(handle);
-	// SAFETY: The handle was returned by OpenProcess and is closed exactly once here.
-	let _close_result = unsafe { CloseHandle(handle) };
-	terminated
-}
-
 
 /// Represents the result of waiting for an executing process.
 pub enum ProcessWaitResult {

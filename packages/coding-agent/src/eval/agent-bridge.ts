@@ -6,21 +6,19 @@ import { MAIN_AGENT_ID } from "../registry/agent-registry";
 import { createEvalCustomTools, describeEvalTools } from "../task/eval-tools";
 import {
 	buildStructuredSubagentRecoveryHint,
+	invalidModelSelectorReason,
 	reserveStructuredSubagentId,
 	resolveEffectiveSubagentPolicy,
 	runStructuredSubagent,
 	StructuredSubagentError,
 	type StructuredSubagentIsolationControls,
 	type StructuredSubagentResult,
-	type StructuredSubagentSchemaMode,
 } from "../task/structured-subagent";
-import type { AgentProgress, SingleResult } from "../task/types";
-import type { NestedRepoPatch } from "../task/worktree";
+import type { AgentProgress, SingleResult, StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
+import type { NestedRepoPatch } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "../tools";
-import { ToolError } from "../tools/tool-errors";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import type { JsStatusEvent } from "./js/shared/types";
-// Import review tools for side effects (registers subagent tool handlers).
-import "../tools/review";
 
 /** Synthetic bridge name reserved for the `agent()` helper across both runtimes. */
 export const EVAL_AGENT_BRIDGE_NAME = "__agent__";
@@ -28,6 +26,7 @@ export const EVAL_AGENT_BRIDGE_NAME = "__agent__";
 const agentArgsSchema = type({
 	prompt: "string>0",
 	"agent?": "string>0",
+	"model?": "string | string[]",
 	"label?": "string",
 	"schema?": "unknown",
 	"schemaMode?": "'permissive' | 'strict'",
@@ -41,6 +40,7 @@ const agentArgsSchema = type({
 interface EvalAgentArgs {
 	prompt: string;
 	agent?: string;
+	model?: string | string[];
 	label?: string;
 	schema?: unknown;
 	schemaMode?: StructuredSubagentSchemaMode;
@@ -92,6 +92,10 @@ function parseAgentArgs(args: unknown): EvalAgentArgs {
 	if (result instanceof type.errors) {
 		throw new ToolError(`agent() received invalid arguments: ${result.summary}`);
 	}
+	// The wire layer owns blank and malformed-array rejection so
+	// the shared preflight's empty-selector carve-out stays internal-only.
+	const selectorProblem = invalidModelSelectorReason(result.model, "agent()");
+	if (selectorProblem) throw new ToolError(selectorProblem);
 	return result;
 }
 
@@ -199,6 +203,7 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 			invocationKind: "eval",
 			assignment: parsed.prompt,
 			...(parsed.agent !== undefined ? { agent: parsed.agent } : {}),
+			...(parsed.model !== undefined ? { model: parsed.model } : {}),
 			...(Object.hasOwn(parsed, "schema") ? { outputSchema: parsed.schema } : {}),
 			...(parsed.schemaMode !== undefined ? { schemaMode: parsed.schemaMode } : {}),
 			...(isolation ? { isolation } : {}),
@@ -222,6 +227,7 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 						invocationKind: "eval",
 						assignment: parsed.prompt,
 						...(parsed.agent !== undefined ? { agent: parsed.agent } : {}),
+						...(parsed.model !== undefined ? { model: parsed.model } : {}),
 						...(Object.hasOwn(parsed, "schema") ? { outputSchema: parsed.schema } : {}),
 						...(parsed.schemaMode !== undefined ? { schemaMode: parsed.schemaMode } : {}),
 						identity: { id, label: parsed.label },
@@ -229,7 +235,6 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 						...(customTools ? { customTools } : {}),
 						retainArtifacts: true,
 						keepAlive: true,
-						shareEvalSession: false,
 						signal,
 						onProgress: progress => {
 							latestProgress = progress;
