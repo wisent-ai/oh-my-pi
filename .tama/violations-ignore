@@ -1,0 +1,10 @@
+# oh-my-pi is an upstream project (github.com/can1357/oh-my-pi) that this
+# checkout merges from. Its maintainers choose its module layout; splitting a
+# file they keep whole would turn every later upstream merge into a conflict
+# on that file. Each entry is an upstream file that a local repair has to edit.
+packages/agent/src/compaction/compaction.ts
+# Upstream's per-package changelog: one file per package, appended under
+# [Unreleased] and normalized by its release script.
+packages/agent/CHANGELOG.md
+# The repository's own script folder holds upstream's release and CI scripts.
+scripts/.

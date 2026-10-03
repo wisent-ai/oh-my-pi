@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Compacting a session whose current turn is larger than the summarizer accepts no longer fails with a request-too-large error: the turn prefix is now summarized in windows that fit, like the history summary, and the short summary's input is clamped to one request.
+
 ## [18.6.0] - 2026-10-03
 
 ### Fixed
