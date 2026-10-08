@@ -25,6 +25,7 @@ import {
 	markPerCallContextMessage,
 	setContextHistoryIndex,
 } from "@oh-my-pi/pi-ai/utils/block-symbols";
+import { relaxForcedToolChoiceForModel } from "@oh-my-pi/pi-ai/utils/tool-choice";
 import type { KeyId } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
 import { refreshShellConfigCache } from "@oh-my-pi/pi-utils/procmgr";
@@ -2069,6 +2070,9 @@ export class ExtensionRunner {
 			}
 		}
 
+		// The provider fitted the payload it built to the model's compat; a handler
+		// can write a forced tool choice back in, which such a model answers with a 400.
+		if (model) relaxForcedToolChoiceForModel(currentPayload, model);
 		return currentPayload;
 	}
 
