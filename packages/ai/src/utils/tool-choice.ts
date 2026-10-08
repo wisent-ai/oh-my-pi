@@ -1,7 +1,7 @@
 /**
  * Utility functions for mapping unified ToolChoice to provider-specific formats.
  */
-import type { ToolChoice } from "../types";
+import type { Model, ToolChoice } from "../types";
 
 /** OpenAI Completions API tool choice format */
 export type OpenAICompletionsToolChoice =
@@ -65,6 +65,55 @@ export function mapToOpenAICompletionsToolChoice(choice?: ToolChoice): OpenAICom
 export function isForcedToolChoice(choice: unknown): boolean {
 	if (choice === undefined || choice === "auto" || choice === "none") return false;
 	return true;
+}
+
+/**
+ * Turns a forced OpenAI `tool_choice` (`"required"` or a named function) into
+ * `"auto"`, for a model whose compat sets `supportsForcedToolChoice: false`:
+ * such a model rejects the forced selector with a 400 whoever wrote it. The
+ * tool stays offered.
+ */
+function relaxForcedOpenAIToolChoice(params: { tool_choice?: unknown }): void {
+	if (isForcedToolChoice(params.tool_choice)) params.tool_choice = "auto";
+}
+
+/**
+ * {@link relaxForcedOpenAIToolChoice} for an Anthropic Messages payload, where
+ * `{ type: "any" }` and `{ type: "tool", name }` are the forced selectors.
+ */
+function relaxForcedAnthropicToolChoice(params: { tool_choice?: { type: string } }): void {
+	const type = params.tool_choice?.type;
+	if (type === "any" || type === "tool") params.tool_choice = { type: "auto" };
+}
+
+/**
+ * {@link relaxForcedOpenAIToolChoice} for a Bedrock Converse request. Its
+ * `toolConfig.toolChoice` holds exactly one of `auto`, `any` and `tool`, so
+ * every choice other than `auto` is forced.
+ */
+function relaxForcedBedrockToolChoice(request: { toolConfig?: { toolChoice?: object } }): void {
+	const toolConfig = request.toolConfig;
+	const choice = toolConfig?.toolChoice;
+	if (toolConfig && choice && !("auto" in choice)) toolConfig.toolChoice = { auto: {} };
+}
+
+/**
+ * Puts a provider payload back inside the model's forced-tool-choice compat.
+ * Providers fit the request they build; this fits the one an `onPayload`
+ * hook hands back, in the wire shape of `model.api`. It changes nothing for a
+ * model that accepts forced selection, or for a payload that is not an object.
+ */
+export function relaxForcedToolChoiceForModel(payload: unknown, model: Model): void {
+	const compat = model.compat as { supportsForcedToolChoice?: boolean } | undefined;
+	if (compat?.supportsForcedToolChoice !== false) return;
+	if (!payload || typeof payload !== "object") return;
+	if (model.api === "anthropic-messages") {
+		relaxForcedAnthropicToolChoice(payload as { tool_choice?: { type: string } });
+	} else if (model.api === "bedrock-converse-stream") {
+		relaxForcedBedrockToolChoice(payload as { toolConfig?: { toolChoice?: object } });
+	} else {
+		relaxForcedOpenAIToolChoice(payload as { tool_choice?: unknown });
+	}
 }
 
 /**
