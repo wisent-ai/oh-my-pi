@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Fixed an extension's `before_provider_request` handler being able to force a tool call on a model that rejects forced tool selection (Opus 5.5, Sonnet 5.5, Fable, Mythos, and OpenAI-compatible models with `supportsForcedToolChoice: false`), which ended every request of the session with `400 tool_choice: type "tool" and "any" are not supported for this model`; the forced selector a handler writes is now downgraded to `auto`, as the provider already does for the payload it builds
 - Fixed `omp auth-broker serve` logging every client as `unknown` (or as whatever a caller put in `X-Forwarded-For`); it now logs the socket address, with `--trust-proxy-headers` for brokers behind a reverse proxy ([#14762](https://github.com/can1357/oh-my-pi/pull/14762) by [@will-bogusz](https://github.com/will-bogusz))
 - Fixed relative file links in Tern assistant replies opening against the folder omp was started in after `/wt` or `/move`; they now open the file in the session's working directory ([#14879](https://github.com/can1357/oh-my-pi/pull/14879) by [@H4vC](https://github.com/H4vC))
 - Fixed the BTW history, git shortcuts, and autoresearch sheets in Tern having no Close button, and the plan review sheet having no Cancel button ([#14894](https://github.com/can1357/oh-my-pi/pull/14894) by [@H4vC](https://github.com/H4vC))
